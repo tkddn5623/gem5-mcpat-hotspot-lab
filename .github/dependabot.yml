@@ -1,0 +1,21 @@
+---
+version: 2
+updates:
+    - package-ecosystem: pip
+      directory: /
+      exclude-paths:
+          - ext/**
+      schedule:
+          interval: monthly
+      assignees:
+          - Harshil2107
+          - erin-le
+      commit-message:
+          prefix: 'misc: '
+    # Raise pull requests for version updates
+    # to pip against the `develop` branch
+      target-branch: develop
+    # Labels on pull requests for version updates only
+      labels:
+          - misc
+          - dependencies

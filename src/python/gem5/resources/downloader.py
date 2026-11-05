@@ -1,0 +1,847 @@
+# Copyright (c) 2021-2023 The Regents of the University of California
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are
+# met: redistributions of source code must retain the above copyright
+# notice, this list of conditions and the following disclaimer;
+# redistributions in binary form must reproduce the above copyright
+# notice, this list of conditions and the following disclaimer in the
+# documentation and/or other materials provided with the distribution;
+# neither the name of the copyright holders nor the names of its
+# contributors may be used to endorse or promote products derived from
+# this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+# OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+import gzip
+import hashlib
+import math
+import os
+import random
+import shutil
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import (
+    Dict,
+    List,
+    Optional,
+)
+from urllib.error import HTTPError
+from urllib.parse import urlparse
+
+from m5.util import warn
+
+from _m5 import core
+
+from ..utils.filelock import FileLock
+from ..utils.progress_bar import (
+    progress_hook,
+    tqdm,
+)
+from ..utils.socks_ssl_context import get_proxy_context
+from .client import get_resource_json_obj
+from .client import list_resources as client_list_resources
+from .md5_utils import (
+    md5_dir,
+    md5_file,
+)
+
+"""
+This Python module contains functions used to download, list, and obtain
+information about resources from resources.gem5.org.
+"""
+
+
+_SPARSE_COPY_CHUNK_SIZE = 1024 * 1024
+
+
+def _copy_to_sparse_file(source, destination) -> str:
+    """Copy a byte stream while turning zero-filled chunks into holes.
+
+    The returned MD5 hash describes the logical contents of the destination.
+    Sparse and dense copies of the same file therefore produce the same hash.
+    """
+
+    md5 = hashlib.md5()
+    zero_chunk = bytes(_SPARSE_COPY_CHUNK_SIZE)
+
+    while chunk := source.read(_SPARSE_COPY_CHUNK_SIZE):
+        md5.update(chunk)
+        if len(chunk) == _SPARSE_COPY_CHUNK_SIZE:
+            is_zero = chunk == zero_chunk
+        else:
+            is_zero = chunk == zero_chunk[: len(chunk)]
+
+        if not is_zero:
+            destination.write(chunk)
+        else:
+            # Seeking instead of writing advances the logical file position
+            # without allocating blocks on filesystems that support holes.
+            destination.seek(len(chunk), os.SEEK_CUR)
+
+    # A seek beyond the last written byte does not extend a file. Truncating at
+    # the current position preserves any zero-filled chunk at the end.
+    destination.truncate()
+    return md5.hexdigest()
+
+
+def _copy_to_dense_file(source, destination) -> str:
+    """Copy a byte stream without creating filesystem holes."""
+
+    md5 = hashlib.md5()
+    while chunk := source.read(_SPARSE_COPY_CHUNK_SIZE):
+        md5.update(chunk)
+        destination.write(chunk)
+    return md5.hexdigest()
+
+
+def _write_file_atomically(
+    source,
+    to_path: str,
+    sparse: bool,
+    expected_md5: str | None = None,
+    copy_stat_from: str | None = None,
+) -> None:
+    """Write ``source`` and atomically replace ``to_path``."""
+
+    destination = Path(to_path)
+    # Keep the temporary file beside the destination so that os.replace is an
+    # atomic rename within a single filesystem.
+    file_descriptor, temporary_path = tempfile.mkstemp(
+        dir=destination.parent,
+        prefix=f".{destination.name}.",
+        suffix=".part",
+    )
+
+    try:
+        with os.fdopen(file_descriptor, "wb") as output:
+            copy = _copy_to_sparse_file if sparse else _copy_to_dense_file
+            md5 = copy(source, output)
+            output.flush()
+            os.fsync(output.fileno())
+
+        # The checksum covers the decompressed logical contents, including
+        # zeroes represented by holes, rather than the downloaded gzip stream.
+        if expected_md5 is not None and md5 != expected_md5:
+            raise Exception(
+                f"The downloaded resource has an invalid MD5 checksum: "
+                f"expected {expected_md5}, received {md5}."
+            )
+
+        if copy_stat_from is not None:
+            shutil.copystat(copy_stat_from, temporary_path)
+        else:
+            # ``mkstemp`` always creates mode 0600, unlike the previous dense
+            # download path. Apply the normal umask-derived file mode so a
+            # shared resource cache remains readable by other accounts.
+            current_umask = os.umask(0)
+            os.umask(current_umask)
+            os.chmod(temporary_path, 0o666 & ~current_umask)
+
+        os.replace(temporary_path, to_path)
+    except Exception:
+        try:
+            os.remove(temporary_path)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _write_sparse_file(
+    source,
+    to_path: str,
+    expected_md5: str | None = None,
+    copy_stat_from: str | None = None,
+) -> None:
+    """Write ``source`` sparsely and atomically replace ``to_path``."""
+
+    _write_file_atomically(
+        source=source,
+        to_path=to_path,
+        sparse=True,
+        expected_md5=expected_md5,
+        copy_stat_from=copy_stat_from,
+    )
+
+
+def _write_dense_file(
+    source,
+    to_path: str,
+    expected_md5: str | None = None,
+    copy_stat_from: str | None = None,
+) -> None:
+    """Write ``source`` densely and atomically replace ``to_path``."""
+
+    _write_file_atomically(
+        source=source,
+        to_path=to_path,
+        sparse=False,
+        expected_md5=expected_md5,
+        copy_stat_from=copy_stat_from,
+    )
+
+
+def _sparsify_file(
+    path: str,
+    expected_md5: str | None = None,
+) -> None:
+    """Atomically replace an existing file with a sparse equivalent."""
+
+    with open(path, "rb") as source:
+        _write_sparse_file(
+            source=source,
+            to_path=path,
+            expected_md5=expected_md5,
+            copy_stat_from=path,
+        )
+
+
+def _densify_file(
+    path: str,
+    expected_md5: str | None = None,
+) -> None:
+    """Atomically replace an existing file with a dense equivalent."""
+
+    with open(path, "rb") as source:
+        _write_dense_file(
+            source=source,
+            to_path=path,
+            expected_md5=expected_md5,
+            copy_stat_from=path,
+        )
+
+
+def _file_has_holes(path: str) -> bool:
+    """Return whether the host filesystem reports holes in ``path``."""
+
+    file_stat = os.stat(path)
+    if not hasattr(file_stat, "st_blocks"):
+        return False
+    return file_stat.st_blocks * 512 < file_stat.st_size
+
+
+def _download_to_sparse_file(
+    url: str,
+    to_path: str,
+    decompress: bool,
+    expected_md5: str | None = None,
+    max_attempts: int = 6,
+) -> None:
+    """Download a resource directly into a sparse local file.
+
+    If ``decompress`` is true, ``url`` is interpreted as a gzip stream. The
+    compressed bytes are never stored locally.
+    """
+
+    attempt = 0
+    while True:
+        try:
+            request = urllib.request.Request(url)
+            proxy_context = get_proxy_context()
+            with urllib.request.urlopen(
+                request,
+                context=proxy_context,
+            ) as response:
+                total = response.headers.get("Content-Length")
+                with tqdm.wrapattr(
+                    response,
+                    "read",
+                    miniters=1,
+                    desc=f"Downloading {to_path}",
+                    total=int(total) if total is not None else None,
+                ) as downloaded:
+                    if decompress:
+                        with gzip.GzipFile(
+                            fileobj=downloaded,
+                            mode="rb",
+                        ) as source:
+                            _write_sparse_file(
+                                source=source,
+                                to_path=to_path,
+                                expected_md5=expected_md5,
+                            )
+                    else:
+                        _write_sparse_file(
+                            source=downloaded,
+                            to_path=to_path,
+                            expected_md5=expected_md5,
+                        )
+            return
+        except HTTPError as error:
+            if error.code not in (408, 429) and not 500 <= error.code < 600:
+                raise
+        except ConnectionResetError:
+            # ``ConnectionResetError`` already identifies the retryable
+            # condition. Its errno is host-specific (104 on Linux, 54 on
+            # macOS), so filtering by the Linux value disables retries on
+            # other supported hosts.
+            pass
+        except EOFError:
+            # ``gzip.GzipFile`` raises ``EOFError`` when an HTTP response ends
+            # before the gzip trailer arrives. Retry the complete request;
+            # the atomic writer has already removed the partial output.
+            pass
+
+        attempt += 1
+        if attempt >= max_attempts:
+            raise Exception(
+                f"After {attempt} attempts, resource '{url}' could not be "
+                "downloaded."
+            )
+        time.sleep((2**attempt) + random.uniform(0, 1))
+
+
+def _download(url: str, download_to: str, max_attempts: int = 6) -> None:
+    """
+    Downloads a file.
+
+    The function will run a Truncated Exponential Backoff algorithm to retry
+    the download if the HTTP Status Code returned is deemed retryable.
+
+    :param url: The URL of the file to download.
+
+    :param download_to: The location the downloaded file is to be stored.
+
+    :param max_attempts: The max number of download attempts before stopping.
+                         The default is 6. This translates to roughly 1 minute
+                         of retrying before stopping.
+    """
+
+    # TODO: This whole setup will only work for single files we can get via
+    # wget. We also need to support git clones going forward.
+
+    attempt = 0
+    while True:
+        # The loop will be broken on a successful download, via a `return`, or
+        # if an exception is raised. An exception will be raised if the maximum
+        # number of download attempts has been reached or if a HTTP status code
+        # other than 408, 429, or 5xx is received.
+        try:
+            proxy_context = get_proxy_context()
+            if proxy_context:
+                # get the file as a bytes blob
+                request = urllib.request.Request(url)
+                with urllib.request.urlopen(
+                    request, context=proxy_context
+                ) as fr:
+                    with tqdm.wrapattr(
+                        open(download_to, "wb"),
+                        "write",
+                        miniters=1,
+                        desc="Downloading {download_to}",
+                        total=getattr(fr, "length", None),
+                    ) as fw:
+                        for chunk in fr:
+                            fw.write(chunk)
+            else:
+                with tqdm(
+                    unit="B",
+                    unit_scale=True,
+                    unit_divisor=1024,
+                    miniters=1,
+                    desc=f"Downloading {download_to}",
+                ) as t:
+                    urllib.request.urlretrieve(
+                        url, download_to, reporthook=progress_hook(t)
+                    )
+            return
+        except HTTPError as e:
+            # If the error code retrieved is retryable, we retry using a
+            # Truncated Exponential backoff algorithm, truncating after
+            # "max_attempts". We consider HTTP status codes 408, 429, and 5xx
+            # as retryable. If any other is retrieved we raise the error.
+            if e.code in (408, 429) or 500 <= e.code < 600:
+                attempt += 1
+                if attempt >= max_attempts:
+                    raise Exception(
+                        f"After {attempt} attempts, the resource json could "
+                        "not be retrieved. HTTP Status Code retrieved: "
+                        f"{e.code}"
+                    )
+                time.sleep((2**attempt) + random.uniform(0, 1))
+            else:
+                raise e
+        except ConnectionResetError as e:
+            # This catches the ConnectionResetError we see occassionally see
+            # when accessing resources on GitHub Actions.  It retries using a
+            # Truncated Exponential backoff algorithm, truncating after
+            # "max_attempts". If any other is retrieved we raise the error.
+            if e.errno == 104:
+                attempt += 1
+                if attempt >= max_attempts:
+                    raise Exception(
+                        f"After {attempt} attempts, the resource json could "
+                        "not be retrieved. OS Error Code retrieved: "
+                        f"{e.errno}"
+                    )
+                time.sleep((2**attempt) + random.uniform(0, 1))
+            else:
+                raise e
+        except ValueError as e:
+            raise Exception(
+                f"ValueError: {e}\n"
+                "Environment variable GEM5_USE_PROXY is set to "
+                f"'{use_proxy}'. The expected form is "
+                "<host>:<port>'."
+            )
+        except ImportError as e:
+            raise Exception(
+                f"ImportError: {e}\n"
+                "An import error has occurred. This is likely due "
+                "the Python SOCKS client module not being "
+                "installed. It can be installed with "
+                "`pip install PySocks`."
+            )
+
+
+def list_resources(
+    clients: list | None = None, gem5_version: str | None = None
+) -> dict[str, list[str]]:
+    """
+    Lists all available resources. Returns a dictionary where the key is the
+    id of the resources and the value is a list of that resource's versions.
+
+    :param clients: A list of clients to use when listing resources. If ``None``,
+                    all clients will be used. ``None`` by default.
+
+    :param gem5_version: The gem5 version to which all resources should be
+                         compatible with. If ``None``, compatibility of resources
+                         is not considered and all resources will be returned.
+
+    .. note::
+
+        This function is here for legacy reasons. The ``list_resources``
+        function was originally stored here. In order to remain backwards
+        compatible, this function will call the ``client_list_resources`` function.
+
+    """
+    return client_list_resources(clients=clients, gem5_version=gem5_version)
+
+
+def get_resource(
+    resource_name: str,
+    to_path: str,
+    unzip: bool = True,
+    untar: bool = True,
+    download_md5_mismatch: bool = True,
+    resource_version: str | None = None,
+    clients: list | None = None,
+    gem5_version: str | None = core.gem5Version,
+    quiet: bool = False,
+    sparse: bool = True,
+    skip_cache_hash_check: bool = False,
+    lock_timeout: float = 900,
+) -> None:
+    """
+    Obtains a gem5 resource and stored it to a specified location. If the
+    specified resource is already at the location, no action is taken.
+
+    :param resource_name: The resource to be obtained.
+
+    :param to_path: The location in the file system the resource is to be
+                    stored. The filename should be included.
+
+    :param unzip: If ``True``, gzipped resources will be unzipped prior to saving
+                  to ``to_path``. ``True`` by default.
+
+    :param untar: If ``True``, tar achieve resource will be unpacked prior to
+                  saving to ``to_path``. ``True`` by default.
+
+    :param sparse: If ``True``, disk images are downloaded or decompressed
+                   sparsely. If ``False``, they are materialized densely.
+                   ``True`` by default.
+
+    :param download_md5_mismatch: If a resource is present with an incorrect
+                                  hash (e.g., an outdated version of the resource
+                                  is present), ``get_resource`` will delete this
+                                  local resource and re-download it if this parameter
+                                  is ``True``. ``True`` by default.
+
+    :param resource_version: The version of the resource to be obtained. If
+                             ``None``, the latest version of the resource compatible
+                             with the working directory's gem5 version will be obtained.
+                             ``None`` by default.
+
+    :param clients: A list of clients to use when obtaining the resource. If
+                    ``None``, all clients will be used. ``None`` by default.
+
+    :param gem5_version: The gem5 version to use when obtaining the resource.
+                         By default, the version of gem5 being used is used. This
+                         is used primarily for testing purposes.
+
+    :param quiet: If ``True``, no output will be printed to the console (baring
+                  exceptions). ``False`` by default.
+
+    :param skip_cache_hash_check: Trust an existing cache path without hashing
+                   its contents, and warn even when ``quiet`` is set. Defaults
+                   to ``False``. Cached disk images keep their current storage
+                   representation. Missing resources are downloaded normally.
+
+    :param lock_timeout: Maximum seconds to wait for the resource lock. Defaults
+                   to 900. Must be finite and non-negative.
+
+    :raises Exception: An exception is thrown if a file is already present at
+                       ``to_path`` but it does not have the correct md5 sum. An
+                       exception will also be thrown is a directory is present
+                       at ``to_path``.
+    """
+
+    if not isinstance(skip_cache_hash_check, bool):
+        raise TypeError("skip_cache_hash_check must be a bool.")
+    if isinstance(lock_timeout, bool) or not isinstance(
+        lock_timeout, (int, float)
+    ):
+        raise TypeError("lock_timeout must be a finite non-negative number.")
+    if not math.isfinite(lock_timeout) or lock_timeout < 0:
+        raise ValueError("lock_timeout must be a finite non-negative number.")
+
+    def report_wait(elapsed):
+        print(
+            f"Waiting for resource '{resource_name}' at '{to_path}': "
+            f"{elapsed:.0f}s elapsed, {lock_timeout:g}s timeout. "
+            "Another process may be downloading or verifying it.",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    # Keep exclusive-create locking even when hashes are skipped: another
+    # process may still be writing the cache entry. Retain the existing lock
+    # path for compatibility with other gem5 processes sharing the cache.
+    with FileLock(
+        f"{to_path}.lock",
+        timeout=lock_timeout,
+        delay=1,
+        on_wait=None if quiet else report_wait,
+    ):
+        resource_json = get_resource_json_obj(
+            resource_name,
+            resource_version=resource_version,
+            clients=clients,
+            gem5_version=gem5_version,
+        )
+
+        if not isinstance(sparse, bool):
+            raise TypeError(
+                f"sparse must be a bool, got {type(sparse).__name__}."
+            )
+
+        # Sparse storage is a disk-image policy. Include the legacy generic
+        # resource shape that ``obtain_resource`` specializes as a disk image.
+        is_disk_image = resource_json.get("category") == "disk-image" or (
+            resource_json.get("category") == "resource"
+            and "root_partition" in resource_json
+        )
+        make_sparse = sparse and is_disk_image
+
+        if os.path.exists(to_path):
+            if skip_cache_hash_check:
+                warn(
+                    f"Using cached resource '{resource_name}' at '{to_path}' "
+                    "without checking its hash (skip_cache_hash_check=True). "
+                    "The cache path is trusted; corrupted or incorrect "
+                    "contents will not be detected."
+                )
+                return
+            if os.path.isfile(to_path):
+                md5 = md5_file(Path(to_path))
+            else:
+                md5 = md5_dir(Path(to_path))
+
+            if md5 == resource_json.get("md5sum"):
+                # In this case, the file has already been download, no need to
+                # do so again.
+                if (
+                    make_sparse
+                    and os.path.isfile(to_path)
+                    and not _file_has_holes(to_path)
+                ):
+                    # A valid dense image may predate sparse downloading.
+                    # Rewrite it atomically so the requested representation is
+                    # also honored for resources already in the cache.
+                    _sparsify_file(
+                        path=to_path,
+                        expected_md5=resource_json.get("md5sum"),
+                    )
+                elif (
+                    not sparse
+                    and is_disk_image
+                    and os.path.isfile(to_path)
+                    and _file_has_holes(to_path)
+                ):
+                    # Honor an explicit dense request even when the valid
+                    # cached image was previously materialized sparsely.
+                    _densify_file(
+                        path=to_path,
+                        expected_md5=resource_json.get("md5sum"),
+                    )
+                return
+            elif download_md5_mismatch or "md5sum" not in resource_json:
+                # In the case the the md5sum is not present in the resource
+                # JSON/dict or the ,md5sum is present but does not match that
+                # of the local file, the local file will be deleted and the
+                # resource will be downloaded again.
+                if os.path.isfile(to_path):
+                    os.remove(to_path)
+                else:
+                    shutil.rmtree(to_path)
+                if "md5sum" not in resource_json:
+                    warn(
+                        f"The 'md5sum' field of {resource_name}, version "
+                        f"{resource_version} is not present or set. This is "
+                        "not recommended as it forces a re-download of the "
+                        "resource on every call to get_resource."
+                    )
+                # if the md5sum of the local resource != the md5sum in the
+                # retrieved JSON
+                elif md5 != resource_json.get("md5sum"):
+                    most_recent_resource_version = get_resource_json_obj(
+                        resource_name,
+                        resource_version=None,
+                        clients=clients,
+                        gem5_version=gem5_version,
+                    )["resource_version"]
+
+                    # Check if the local version of requested resource is
+                    # different from the requested version
+                    int_most_recent_resource_version = int(
+                        most_recent_resource_version.split(".")[0]
+                    )
+                    version_mismatch = False
+                    # iterate through jsons of the requested resource by
+                    # version, starting from 1.0.0 to the latest version,
+                    # and try to match md5sums to determine local version.
+                    for i in range(1, int_most_recent_resource_version + 1):
+                        temp_resource_version = f"{i}.0.0"
+                        temp_resource_json = get_resource_json_obj(
+                            resource_name,
+                            resource_version=temp_resource_version,
+                            clients=clients,
+                            gem5_version=gem5_version,
+                        )
+                        # If we match the md5sum of the local resource, and the
+                        # resource version to get != the local resource version
+                        if (
+                            temp_resource_json.get("md5sum") == md5
+                            and resource_version != temp_resource_version
+                        ):
+                            warn(
+                                f"Redownloading {resource_name} to get "
+                                f"version {resource_version}. The local "
+                                f"version of the resource is currently "
+                                f"{temp_resource_version}."
+                            )
+                            version_mismatch = True
+                            break
+                    if not version_mismatch:
+                        warn(
+                            "There is a mismatch between the md5sum of the "
+                            f"local and remote copies of {resource_name}, "
+                            f"version {resource_version}. Redownloading..."
+                        )
+
+            else:
+                raise Exception(
+                    "There already a file present at '{}' but "
+                    "its md5 value is invalid.".format(to_path)
+                )
+
+        download_dest = to_path
+
+        # This if-statement is remain backwards compatable with the older,
+        # string-based way of doing things. It can be refactored away over
+        # time:
+        # https://gem5-review.googlesource.com/c/public/gem5-resources/+/51168
+        is_zipped = False
+        if "is_zipped" in resource_json:
+            if isinstance(resource_json["is_zipped"], str):
+                is_zipped = resource_json["is_zipped"].lower() == "true"
+            elif isinstance(resource_json["is_zipped"], bool):
+                is_zipped = resource_json["is_zipped"]
+            else:
+                raise Exception(
+                    "The resource.json entry for '{}' has a value for the "
+                    "'is_zipped' field which is neither a string or a boolean.".format(
+                        resource_name
+                    )
+                )
+        run_unzip = unzip and is_zipped
+
+        is_tar_archive = bool(resource_json.get("is_tar_archive", False))
+        run_tar_extract = untar and is_tar_archive
+
+        # Sparse materialization only applies to the logical disk image. If
+        # archive extraction was disabled, preserve the packaged bytes using
+        # the existing dense path. Tar archives also retain dense extraction
+        # because they may create multiple paths.
+        sparse_download = (
+            make_sparse and not is_tar_archive and (not is_zipped or run_unzip)
+        )
+
+        tar_extension = ".tar"
+        if run_tar_extract:
+            download_dest += tar_extension
+
+        zip_extension = ".gz"
+        if run_unzip:
+            download_dest += zip_extension
+
+        file_uri_path = _file_uri_to_path(resource_json["url"])
+        if sparse_download:
+            if file_uri_path:
+                if not file_uri_path.exists():
+                    raise Exception(
+                        f"Could not find file at path '{file_uri_path}'"
+                    )
+                print(
+                    "Resource '{}' is being copied sparsely from '{}' to "
+                    "'{}'...".format(
+                        resource_name,
+                        urlparse(resource_json["url"]).path,
+                        to_path,
+                    )
+                )
+                if run_unzip:
+                    with gzip.open(file_uri_path, "rb") as source:
+                        _write_sparse_file(
+                            source=source,
+                            to_path=to_path,
+                            expected_md5=resource_json.get("md5sum"),
+                            copy_stat_from=str(file_uri_path),
+                        )
+                else:
+                    with open(file_uri_path, "rb") as source:
+                        _write_sparse_file(
+                            source=source,
+                            to_path=to_path,
+                            expected_md5=resource_json.get("md5sum"),
+                            copy_stat_from=str(file_uri_path),
+                        )
+            else:
+                if not quiet:
+                    print(
+                        f"Resource '{resource_name}' was not found locally. "
+                        f"Downloading sparsely to '{to_path}'..."
+                    )
+                _download_to_sparse_file(
+                    url=resource_json["url"],
+                    to_path=to_path,
+                    decompress=run_unzip,
+                    expected_md5=resource_json.get("md5sum"),
+                )
+            download_dest = to_path
+            run_unzip = False
+        elif file_uri_path:
+            if not file_uri_path.exists():
+                raise Exception(
+                    f"Could not find file at path '{file_uri_path}'"
+                )
+            print(
+                "Resource '{}' is being copied from '{}' to '{}'...".format(
+                    resource_name,
+                    urlparse(resource_json["url"]).path,
+                    download_dest,
+                )
+            )
+            shutil.copy(file_uri_path, download_dest)
+        else:
+            # TODO: Might be nice to have some kind of download status bar here..
+            if not quiet:
+                print(
+                    f"Resource '{resource_name}' was not found locally. "
+                    f"Downloading to '{download_dest}'..."
+                )
+
+            # Get the URL.
+            url = resource_json["url"]
+
+            _download(url=url, download_to=download_dest)
+            if not quiet:
+                print(f"Finished downloading resource '{resource_name}'.")
+
+        if run_unzip:
+            if not quiet:
+                print(
+                    f"Decompressing resource '{resource_name}' "
+                    f"('{download_dest}')..."
+                )
+            unzip_to = download_dest[: -len(zip_extension)]
+            with gzip.open(download_dest, "rb") as f:
+                with open(unzip_to, "wb") as o:
+                    shutil.copyfileobj(f, o)
+            os.remove(download_dest)
+            download_dest = unzip_to
+            if not quiet:
+                print(f"Finished decompressing resource '{resource_name}'.")
+
+        if run_tar_extract:
+            if not quiet:
+                print(
+                    f"Unpacking the the resource '{resource_name}' "
+                    f"('{download_dest}')"
+                )
+            unpack_to = download_dest[: -len(tar_extension)]
+            with tarfile.open(download_dest) as f:
+
+                def is_within_directory(directory, target):
+                    abs_directory = os.path.abspath(directory)
+                    abs_target = os.path.abspath(target)
+
+                    prefix = os.path.commonprefix([abs_directory, abs_target])
+
+                    return prefix == abs_directory
+
+                def safe_extract(
+                    tar, path=".", members=None, *, numeric_owner=False
+                ):
+                    for member in tar.getmembers():
+                        member_path = os.path.join(path, member.name)
+                        if not is_within_directory(path, member_path):
+                            raise Exception(
+                                "Attempted Path Traversal in Tar File"
+                            )
+
+                    tar.extractall(path, members, numeric_owner=numeric_owner)
+
+                safe_extract(f, unpack_to)
+            os.remove(download_dest)
+
+
+def _file_uri_to_path(uri: str) -> Path | None:
+    """
+    If the URI uses the File scheme (e.g, ``file://host/path``) then
+    a Path object for the local path is returned, otherwise ``None``.
+
+    .. note::
+
+        Only files from localhost are permitted. An exception is thrown otherwise.
+
+    :param uri: The file URI to convert.
+
+    :returns: The path to the file.
+    """
+
+    if urlparse(uri).scheme == "file":
+        if urlparse(uri).netloc == "" or urlparse(uri).netloc == "localhost":
+            local_path = urlparse(uri).path
+            return Path(local_path)
+        raise Exception(
+            f"File URI '{uri}' specifies host '{urlparse(uri).netloc}'. "
+            "Only localhost is permitted."
+        )
+    return None
