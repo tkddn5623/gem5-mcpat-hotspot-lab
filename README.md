@@ -121,7 +121,7 @@ sudo docker compose run --rm dev sh -c '
     -steady_file results/test-hotspot/gcc.steady'
 ```
 
-````
+
 
 ### Windows / macOS / virtual machines
 
@@ -135,6 +135,6 @@ To run them, allow perf counters on the host:
 
 ```bash
 sudo sysctl kernel.perf_event_paranoid=1
-````
+```
 
 This is a host-wide setting and is reset on reboot.
