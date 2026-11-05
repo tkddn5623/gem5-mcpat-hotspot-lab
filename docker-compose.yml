@@ -1,22 +1,5 @@
-# Usage (from the repo root):
-#   sudo docker compose run --rm dev make build
-#   sudo docker compose run --rm kvm make run -j8
-#   sudo docker compose run --rm kvm make results/1c_4w_blackscholes/steady.temps
-#   sudo docker compose run --rm dev                 # interactive shell (gdb works)
-#
-#   # Long sweep that survives a closed SSH session:
-#   sudo docker compose run -d --rm --name sweep kvm make run -j8
-#   sudo docker logs -f sweep
-#
-#   # Set up .env (run WITHOUT sudo, or the IDs become root's)
-#   printf "MULTICORE_LAB_HOST_UID=%s\nMULTICORE_LAB_HOST_GID=%s\nMULTICORE_LAB_REPO_DIR=%s\nMULTICORE_LAB_KVM_GID=%s\n" \
-#     "$(id -u)" "$(id -g)" "$(pwd)" "$(getent group kvm | cut -d: -f3)" > .env
-#
-# gem5's KVM CPU reads perf counters; if it complains, run once on the host:
-#   sudo sysctl kernel.perf_event_paranoid=1
-#
-# NOTE: On Windows or macOS (Docker Desktop) there is no /dev/kvm.
-# Delete the whole "kvm" service below and use "dev" for everything.
+# Windows/macOS (Docker Desktop) have no /dev/kvm:
+# delete the whole "kvm" service below and use "dev" for everything.
 
 services:
   dev:
@@ -35,14 +18,16 @@ services:
       # keeping it in the repo avoids re-downloading per container
       GEM5_RESOURCE_DIR: ${MULTICORE_LAB_REPO_DIR}/resources
     # gdb needs ptrace and personality() (ASLR toggle);
-    # gem5's KVM CPU also needs perf_event_open, blocked by the default seccomp
+    # gem5's KVM CPU with usePerf=True also needs perf_event_open,
+    # which the default seccomp profile blocks
     cap_add: [SYS_PTRACE]
     security_opt: [seccomp:unconfined]
 
+  # Everything from dev, plus access to the host's KVM device
   kvm:
-    # Everything from dev, plus access to the host's KVM device
     extends:
       service: dev
     devices: ["/dev/kvm:/dev/kvm"]
     # Non-root container user must be in the host's kvm group to open /dev/kvm
     group_add: ["${MULTICORE_LAB_KVM_GID:?}"]
+

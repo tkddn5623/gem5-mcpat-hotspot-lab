@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-lxml \
         python3-pandas \
         python3-matplotlib \
-        xz-utils \
+        xz-utils `# only for the pwndbg installer below` \
     && rm -rf /var/lib/apt/lists/*
 
 # pwndbg as a separate "pwndbg" command (bundles its own patched GDB);
