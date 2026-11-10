@@ -76,7 +76,7 @@ Whether the KVM CPU is used is decided by the gem5 config script; the service on
 
 ### Common commands
 
-It is simply the make commands at the top with `sudo docker compose run --rm` appended.
+These are the make targets above, prefixed with `sudo docker compose run --rm <service>`.
 
 ```bash
 # Build all three tools
@@ -85,26 +85,39 @@ sudo docker compose run --rm dev make build
 # Interactive shell (gdb works)
 sudo docker compose run --rm dev
 
-# All simulations, or just one
-sudo docker compose run --rm kvm make run -j4
-sudo docker compose run --rm kvm make results/1c_4w_blackscholes/steady.temps
+# Print the 20-run plan (no simulation)
+sudo docker compose run --rm dev make plan
 
-# Summarize results into results/summary.csv (also runs any missing simulations)
+# All simulations, or just one: results/<workload>/c<cores>-w<width>/result.json
+sudo docker compose run --rm kvm make run -j4
+sudo docker compose run --rm kvm make results/blackscholes/c1-w4/result.json
+
+# Re-run only McPAT + HotSpot on finished gem5 outputs (after changing the glue code)
+sudo docker compose run --rm dev make postprocess
+
+# results/summary.csv and plots (needs all 20 runs; also runs any missing simulations)
 sudo docker compose run --rm kvm make collect
 ```
+
+A failed run leaves its directory behind and `run.py` refuses to reuse it.
+Delete it before retrying, e.g. `rm -r results/blackscholes/c1-w4`.
 
 ### Smoke tests
 
 ```bash
+# Whole pipeline: gem5 -> McPAT -> HotSpot with a tiny guest program (minutes, no PARSEC)
+sudo docker compose run --rm dev make check
+
 # gem5: SE-mode hello world (seconds, no download)
 sudo docker compose run --rm kvm \
   gem5/build/X86/gem5.opt -d results/test-hello \
   gem5/configs/learning_gem5/part1/simple.py
 
-# gem5: boot Ubuntu with KVM (first run downloads a multi-GB disk image into resources/)
+# gem5: boot Ubuntu with KVM, 3 GiB guest memory
+# (first run downloads a multi-GB disk image into resources/)
 sudo docker compose run --rm kvm \
   gem5/build/X86/gem5.opt -d results/test-kvm \
-  gem5/configs/example/gem5_library/x86-ubuntu-run-with-kvm-no-perf.py
+  script/kvm_smoke_test/smoke-kvm-3gb.py
 
 # McPAT: bundled ARM Cortex-A9 example (seconds);
 # numbers should match mcpat/ExampleResults/ARM_A9_2GHz
@@ -127,7 +140,7 @@ sudo docker compose run --rm dev sh -c '
 
 If the host has no `/dev/kvm`, delete the `kvm` service from `docker-compose.yml` and use `dev` for everything.
 
-## Optional: perf counters for KVM
+## Optional: for KVM
 
 Our configs set `usePerf = False` on KVM cores, so no host change is needed.
 gem5's own examples default to `usePerf = True` and may fail with a perf permission error.
