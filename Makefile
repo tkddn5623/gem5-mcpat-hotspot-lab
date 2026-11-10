@@ -5,15 +5,7 @@ HOTSPOT := HotSpot/hotspot
 # NPROC: Parallel jobs for the gem5 build lower it if the linker gets OOM-killed
 NPROC ?= $(shell nproc)
 
-# On page 4 of the assignment PDF
-WORKLOADS := blackscholes canneal freqmine streamcluster
-CONFIGS   := 1c_4w 4c_4w 8c_4w 4c_2w 4c_8w
-RUNS      := $(foreach c,$(CONFIGS),$(foreach w,$(WORKLOADS),$(c)_$(w)))
-TEMPS     := $(RUNS:%=results/%/steady.temps)
-
-# .SECONDARY: Keep intermediate files (stats.txt, mcpat.out) instead of auto-deleting them
-.PHONY: build gem5 run collect
-.SECONDARY:
+.PHONY: build gem5 plan check run postprocess collect
 .DELETE_ON_ERROR:
 
 build: gem5 $(MCPAT) $(HOTSPOT)
@@ -32,28 +24,52 @@ $(MCPAT):
 $(HOTSPOT):
 	$(MAKE) -C HotSpot
 
-run: $(TEMPS)
+# ---------------------------------------------------------------------------
+# Experiments: driven by script/problem1/run.py (python -m problem1.run).
+# The workload x configuration matrix lives in script/problem1/model.py;
+# the names below only mirror its output layout: results/<workload>/c<cores>-w<width>/
+# ---------------------------------------------------------------------------
 
-# Stage 1: gem5 (hours). The binary is order-only (after |) on purpose:
-# rebuilding gem5 must not silently trigger days of re-simulation.
-# run_gem5.sh must exit non-zero when gem5 fails, so .DELETE_ON_ERROR
-# removes a partial stats.txt.
-results/%/m5out/stats.txt: | $(GEM5)
-	scripts/run_gem5.sh $* $(@D)
+export PYTHONPATH := $(CURDIR)/script
+TOOLS := --gem5 $(CURDIR)/$(GEM5) --mcpat $(CURDIR)/$(MCPAT) --hotspot $(CURDIR)/$(HOTSPOT)
+PIPELINE := python3 -m problem1.run
 
-# Stage 2: gem5 stats -> McPAT XML -> power report (seconds)
-results/%/mcpat.out: results/%/m5out/stats.txt scripts/gem5_to_mcpat.py templates/mcpat.xml | $(MCPAT)
-	python3 scripts/gem5_to_mcpat.py -t templates/mcpat.xml -o results/$*/mcpat.xml results/$*/m5out
-	$(MCPAT) -infile results/$*/mcpat.xml -print_level 5 > $@
+# Must match model.py: 3 + 3 configs with c4-w4 shared, 4 PARSEC workloads (20 runs)
+WORKLOADS := blackscholes canneal freqmine streamcluster
+CONFIGS   := c1-w4 c4-w4 c8-w4 c4-w2 c4-w8
+RESULTS   := $(foreach w,$(WORKLOADS),$(foreach c,$(CONFIGS),results/$(w)/$(c)/result.json))
 
-# Stage 3: McPAT report -> floorplan + power trace -> steady-state temps (seconds)
-results/%/steady.temps: results/%/mcpat.out scripts/mcpat_to_hotspot.py templates/hotspot.config | $(HOTSPOT)
-	python3 scripts/mcpat_to_hotspot.py results/$*
-	$(HOTSPOT) -c templates/hotspot.config \
-		-f results/$*/chip.flp -p results/$*/chip.ptrace -steady_file $@
+# results/<workload>/c<cores>-w<width> -> workload, cores, width
+run_workload = $(word 2,$(subst /, ,$1))
+run_config   = $(word 3,$(subst /, ,$1))
+run_cores    = $(patsubst c%,%,$(word 1,$(subst -, ,$(call run_config,$1))))
+run_width    = $(patsubst w%,%,$(word 2,$(subst -, ,$(call run_config,$1))))
 
-# Gather speedup / power / temperature of every run into one CSV for plotting.
+# Print the 20-run matrix without simulating anything
+plan:
+	$(PIPELINE) plan
+
+# Short gem5 -> McPAT -> HotSpot check with a tiny guest program (no PARSEC)
+check: | $(GEM5) $(MCPAT) $(HOTSPOT)
+	$(PIPELINE) check $(TOOLS) --output results/check
+
+# All 20 runs; "make run -j4" simulates 4 at a time (each gem5 is single-threaded)
+run: $(RESULTS)
+
+# One run = gem5 + McPAT + HotSpot. run.py writes result.json only on success.
+# The tools are order-only: rebuilding gem5 must not re-trigger finished runs.
+# run.py refuses to reuse a run directory: delete a failed one before retrying.
+results/%/result.json: | $(GEM5) $(MCPAT) $(HOTSPOT)
+	$(PIPELINE) run $(TOOLS) --output results \
+		--workload $(call run_workload,$@) \
+		--cores $(call run_cores,$@) --width $(call run_width,$@)
+
+# Re-run only McPAT + HotSpot on finished gem5 outputs (after changing the glue code)
+postprocess: | $(MCPAT) $(HOTSPOT)
+	$(PIPELINE) postprocess $(TOOLS) --output results
+
+# summary.csv, components.csv and the plots; needs all 20 runs
 collect: results/summary.csv
 
-results/summary.csv: $(TEMPS) scripts/collect.py
-	python3 scripts/collect.py results > $@
+results/summary.csv: $(RESULTS)
+	$(PIPELINE) summarize --output results

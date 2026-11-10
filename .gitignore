@@ -3,6 +3,11 @@
 
 # gem5 resource files
 resources/
+.home/
+.venv/
+__pycache__/
+*.pyc
+.local-tools.json
 
 # HotSpot binaries; HotSpot has no .gitignore of its own
 HotSpot/*.o
