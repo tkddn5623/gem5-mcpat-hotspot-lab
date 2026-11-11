@@ -58,6 +58,10 @@ def main():
         cpu.LQEntries = 32
         cpu.SQEntries = 32
         cpu.branchPred = BranchPredictor(conditionalBranchPred=TournamentBP())
+        # wbWidth < 8 makes writebacks spill over more cycles; the default
+        # 5-cycle time buffers then overflow (TimeBuffer out-of-bounds panic)
+        cpu.forwardComSize = 16
+        cpu.backComSize = 16
 
     cache = PrivateL1SharedL2CacheHierarchy(l1i_size="32KiB", l1d_size="32KiB",
                                           l2_size="2MiB", l1i_assoc=8,
@@ -76,9 +80,9 @@ def main():
         kernel = KernelResource(local_path=str(args.kernel.resolve()))
         disk = DiskImageResource(local_path=str(args.disk.resolve()), root_partition=args.root_partition)
     else:
-        kernel = obtain_resource("x86-linux-kernel-4.19.83", resource_version="1.0.0", gem5_version=None,
+        kernel = obtain_resource("x86-linux-kernel-4.19.83", resource_version="1.0.0",
                                  resource_directory=args.resource_directory)
-        disk = obtain_resource("x86-parsec", resource_version="1.0.0", gem5_version=None,
+        disk = obtain_resource("x86-parsec", resource_version="1.0.0",
                                resource_directory=args.resource_directory)
     if not args.smoke_directory:
         board.set_kernel_disk_workload(kernel=kernel, disk_image=disk,
