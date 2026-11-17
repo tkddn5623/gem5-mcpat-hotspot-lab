@@ -120,12 +120,16 @@ def main():
     parser.add_argument("--disk", type=Path)
     parser.add_argument("--root-partition", default="1")
     parser.add_argument("--resource-directory", default="resources")
+    parser.add_argument("--atomic-boot", action="store_true",
+                        help="Boot Linux on Atomic and switch to O3 before PARSEC")
     parser.add_argument("--max-ticks", type=int, default=10**16)
     parser.add_argument("--simulation-timeout", type=int, default=7*24*3600)
     parser.add_argument("--tool-timeout", type=int, default=1800)
     args = parser.parse_args()
     if bool(args.kernel) != bool(args.disk):
         parser.error("Supply --kernel and --disk together")
+    if args.atomic_boot and args.action != "run":
+        parser.error("--atomic-boot is only supported with run")
     if any(x <= 0 for x in (args.max_ticks, args.simulation_timeout, args.tool_timeout)):
         parser.error("Timeouts and max ticks must be positive")
     jobs = [(w, c) for w in WORKLOADS for c in configurations()
@@ -177,6 +181,8 @@ def main():
             command = [args.gem5, "-d", directory / "gem5", ROOT / "problem1/gem5_config.py",
                        "--cores", c.cores, "--width", c.width, "--workload", w,
                        "--resource-directory", args.resource_directory, "--max-ticks", args.max_ticks]
+            if args.atomic_boot:
+                command.append("--atomic-boot")
             if args.kernel:
                 command.extend(["--kernel", args.kernel.resolve(), "--disk", args.disk.resolve(),
                                 "--root-partition", args.root_partition])

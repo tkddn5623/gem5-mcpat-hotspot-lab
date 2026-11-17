@@ -34,14 +34,15 @@ def configurations():
     return list({c.key: c for group in sweeps().values() for c in group}.values())
 
 
-def guest_command(workload, cores):
+def guest_command(workload, cores, atomic_boot=False):
     if workload not in WORKLOADS or cores not in (1, 4, 8):
         raise ValueError("Invalid workload or thread count")
     # gcc-hooks in the official x86-parsec image emits global workbegin/end.
     # freqmine uses OpenMP; match both OpenMP and parsecmgmt thread counts.
+    switch = 'echo "Switching from Atomic to O3 before PARSEC"\nm5 exit\n' if atomic_boot else ""
     return f"""#!/bin/bash
 set -e
-cd /home/gem5/parsec-benchmark
+{switch}cd /home/gem5/parsec-benchmark
 source env.sh
 export OMP_NUM_THREADS={cores}
 export OMP_DYNAMIC=FALSE
