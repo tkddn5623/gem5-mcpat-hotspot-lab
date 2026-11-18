@@ -62,7 +62,8 @@ run: $(RESULTS)
 results/%/result.json: | $(GEM5) $(MCPAT) $(HOTSPOT)
 	$(PIPELINE) run $(TOOLS) --output results \
 		--workload $(call run_workload,$@) \
-		--cores $(call run_cores,$@) --width $(call run_width,$@)
+		--cores $(call run_cores,$@) --width $(call run_width,$@) \
+		--atomic-boot
 
 # Re-run only McPAT + HotSpot on finished gem5 outputs (after changing the glue code)
 postprocess: | $(MCPAT) $(HOTSPOT)
